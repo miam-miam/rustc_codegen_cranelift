@@ -13,6 +13,7 @@ use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mono::{MonoItem, MonoItemData};
+use rustc_middle::ty::GenericArgKind;
 use rustc_session::config::DebugInfo;
 use rustc_span::ErrorGuaranteed;
 
@@ -52,6 +53,8 @@ impl JitSession {
     pub fn new(tcx: TyCtxt<'_>) -> Self {
         let target_cpu = crate::CraneliftCodegenBackend { config: None }.target_cpu(tcx.sess);
         let crate_info = CrateInfo::new(tcx, target_cpu);
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        preload_dylibs_deep_bound(&crate_info);
         JitSession {
             isa: crate::build_isa(tcx.sess, true),
             dylibs: Arc::new(Mutex::new(super::jit::dep_symbol_lookup_fn(tcx.sess, crate_info))),
@@ -85,8 +88,7 @@ impl JitSession {
                 MonoItem::Fn(instance) => {
                     let name = tcx.symbol_name(instance).name;
                     let defined = self.registry.lock().unwrap().contains_key(name);
-                    // Other crates' code can't change during a session.
-                    if defined && !instance.def_id().is_local() {
+                    if defined && !may_change_between_builds(instance) {
                         report.reused_fns += 1;
                         continue;
                     }
@@ -154,8 +156,10 @@ impl JitSession {
         });
 
         // Later builds leave the entry wrapper calling the first build's `main`.
+        // The wrapper goes through `lang_start`, which initialises the program's
+        // std: its arguments, main thread and `Termination` handling.
         if first_build {
-            crate::main_shim::maybe_create_entry_wrapper(tcx, &mut module, true, true);
+            crate::main_shim::maybe_create_entry_wrapper(tcx, &mut module, false, true);
         }
 
         if let Some(guar) = tcx.dcx().has_errors() {
@@ -236,6 +240,56 @@ fn refuse_asm<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> Result<(), E
         }
     }
     result
+}
+
+/// The process already contains another copy of std: rustc's own is built into
+/// `librustc_driver.so`. glibc binds a library's references to its own exported symbols to the
+/// first definition loaded, so a normally loaded `libstd.so` would update the compiler's statics.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn preload_dylibs_deep_bound(crate_info: &CrateInfo) {
+    use libloading::os::unix::{Library, RTLD_LAZY, RTLD_LOCAL};
+    use rustc_middle::middle::dependency_format::Linkage;
+    // glibc's value; libloading doesn't export it.
+    const RTLD_DEEPBIND: c_int = 0x8;
+
+    let formats = &crate_info.dependency_formats[&rustc_structures::CrateType::Executable];
+    // Dependencies before dependents, as `dep_symbol_lookup_fn` loads them.
+    for &cnum in crate_info.used_crates.iter().rev() {
+        if formats[cnum] == Linkage::Dynamic
+            && let Some(path) = &crate_info.used_crate_source[&cnum].dylib
+        {
+            let library =
+                unsafe { Library::open(Some(path), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND) };
+            // Stays loaded for the session, like the libraries `dep_symbol_lookup_fn` leaks.
+            std::mem::forget(library.unwrap());
+        }
+    }
+}
+
+/// Whether an instance's code can differ between builds: it is the local crate's own code, or
+/// another crate's generic code instantiated with local types or closures, whose code it calls.
+fn may_change_between_builds(instance: Instance<'_>) -> bool {
+    instance.def_id().is_local()
+        || instance.args.iter().flat_map(|arg| arg.walk()).any(|arg| {
+            let GenericArgKind::Type(ty) = arg.kind() else { return false };
+            match *ty.kind() {
+                ty::Adt(def, _) => def.did().is_local(),
+                ty::Foreign(def_id)
+                | ty::FnDef(def_id, _)
+                | ty::Closure(def_id, _)
+                | ty::CoroutineClosure(def_id, _)
+                | ty::Coroutine(def_id, _)
+                | ty::CoroutineWitness(def_id, _) => def_id.is_local(),
+                ty::Dynamic(predicates, ..) => {
+                    predicates.iter().any(|predicate| match predicate.skip_binder() {
+                        ty::ExistentialPredicate::Trait(t) => t.def_id.is_local(),
+                        ty::ExistentialPredicate::Projection(p) => p.def_id.is_local(),
+                        ty::ExistentialPredicate::AutoTrait(def_id) => def_id.is_local(),
+                    })
+                }
+                _ => false,
+            }
+        })
 }
 
 fn unit_fn_path(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
