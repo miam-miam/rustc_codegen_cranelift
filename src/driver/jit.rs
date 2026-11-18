@@ -167,7 +167,7 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, target_cpu: String, jit_args: Vec<String>
     std::process::exit(ret);
 }
 
-fn codegen_and_compile_fn<'tcx>(
+pub(super) fn codegen_and_compile_fn<'tcx>(
     tcx: TyCtxt<'tcx>,
     output_filenames: &OutputFilenames,
     should_write_ir: bool,
@@ -222,7 +222,7 @@ fn codegen_and_compile_fn<'tcx>(
 
 pub(super) type SymbolLookup = Box<dyn Fn(&str) -> Option<*const u8> + Send + Sync>;
 
-fn dep_symbol_lookup_fn(sess: &Session, crate_info: CrateInfo) -> SymbolLookup {
+pub(super) fn dep_symbol_lookup_fn(sess: &Session, crate_info: CrateInfo) -> SymbolLookup {
     use rustc_middle::middle::dependency_format::Linkage;
 
     let mut dylib_paths = Vec::new();
