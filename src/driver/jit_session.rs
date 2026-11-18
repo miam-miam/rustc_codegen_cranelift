@@ -13,6 +13,7 @@ use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mono::{MonoItem, MonoItemData};
+use rustc_session::config::DebugInfo;
 use rustc_span::ErrorGuaranteed;
 
 use crate::prelude::*;
@@ -34,6 +35,8 @@ pub struct JitSession {
     isa: Arc<dyn TargetIsa>,
     dylibs: Arc<Mutex<SymbolLookup>>,
     eh_personality: String,
+    /// Register each build's symbols with debuggers through the GDB JIT interface.
+    jit_debug_symbols: bool,
     /// Named functions and data defined by committed builds, latest definition winning. Also the
     /// record of what is defined: nothing else in the session tracks it.
     registry: Arc<Mutex<FxHashMap<String, usize>>>,
@@ -53,6 +56,7 @@ impl JitSession {
             isa: crate::build_isa(tcx.sess, true),
             dylibs: Arc::new(Mutex::new(super::jit::dep_symbol_lookup_fn(tcx.sess, crate_info))),
             eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx).to_string(),
+            jit_debug_symbols: tcx.sess.opts.debuginfo != DebugInfo::None,
             registry: Arc::default(),
             modules: Vec::new(),
             builds: 0,
@@ -176,7 +180,12 @@ impl JitSession {
         builder.symbol_lookup_fn(Box::new(move |name| {
             registry.lock().unwrap().get(name).map(|&addr| addr as *const u8)
         }));
-        UnwindModule::new(JITModule::new(builder), &self.eh_personality, false, false)
+        UnwindModule::new(
+            JITModule::new(builder),
+            &self.eh_personality,
+            false,
+            self.jit_debug_symbols,
+        )
     }
 
     fn commit(&mut self, jit: JITModule) {
