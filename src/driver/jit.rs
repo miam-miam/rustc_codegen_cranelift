@@ -125,7 +125,7 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, target_cpu: String, jit_args: Vec<String>
     std::process::exit(ret);
 }
 
-fn codegen_and_compile_fn<'tcx>(
+pub(super) fn codegen_and_compile_fn<'tcx>(
     tcx: TyCtxt<'tcx>,
     output_filenames: &OutputFilenames,
     should_write_ir: bool,
@@ -176,7 +176,7 @@ fn codegen_and_compile_fn<'tcx>(
     });
 }
 
-fn dep_symbol_lookup_fn(
+pub(super) fn dep_symbol_lookup_fn(
     sess: &Session,
     crate_info: CrateInfo,
 ) -> Box<dyn Fn(&str) -> Option<*const u8> + Send> {
