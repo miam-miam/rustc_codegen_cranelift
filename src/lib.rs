@@ -49,6 +49,8 @@ use rustc_span::{Symbol, sym};
 use rustc_target::spec::{Arch, CfgAbi, Env, Os};
 
 pub use crate::config::*;
+#[cfg(feature = "jit")]
+pub use crate::driver::jit_session::{BuildReport, JitSession};
 use crate::prelude::*;
 
 mod abi;
