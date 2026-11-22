@@ -10,6 +10,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use rustc_codegen_ssa::CrateInfo;
 use rustc_codegen_ssa::base::{allocator_kind_for_codegen, allocator_shim_contents};
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mono::{MonoItem, MonoItemData};
@@ -17,6 +18,9 @@ use rustc_middle::ty::GenericArgKind;
 use rustc_session::config::DebugInfo;
 use rustc_span::ErrorGuaranteed;
 
+use super::jit::SymbolLookup;
+use super::jit_tls::{self, NewThreadLocal};
+use crate::constant::THREAD_LOCAL_ACCESSOR;
 use crate::prelude::*;
 use crate::unwind_module::UnwindModule;
 
@@ -30,11 +34,9 @@ pub struct BuildReport {
     pub reused_fns: usize,
 }
 
-type SymbolLookup = Box<dyn Fn(&str) -> Option<*const u8> + Send>;
-
 pub struct JitSession {
     isa: Arc<dyn TargetIsa>,
-    dylibs: Arc<Mutex<SymbolLookup>>,
+    dylibs: Arc<SymbolLookup>,
     eh_personality: String,
     /// Register each build's symbols with debuggers through the GDB JIT interface.
     jit_debug_symbols: bool,
@@ -47,6 +49,8 @@ pub struct JitSession {
     builds: u32,
     /// Def path of each local `fn()` -> its symbol.
     unit_fns: FxHashMap<String, String>,
+    /// Keys given to thread-locals by committed builds, by symbol.
+    thread_local_keys: FxHashMap<String, usize>,
 }
 
 impl JitSession {
@@ -57,13 +61,14 @@ impl JitSession {
         preload_dylibs_deep_bound(&crate_info);
         JitSession {
             isa: crate::build_isa(tcx.sess, true),
-            dylibs: Arc::new(Mutex::new(super::jit::dep_symbol_lookup_fn(tcx.sess, crate_info))),
+            dylibs: Arc::new(super::jit::dep_symbol_lookup_fn(tcx.sess, crate_info)),
             eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx).to_string(),
             jit_debug_symbols: tcx.sess.opts.debuginfo != DebugInfo::None,
             registry: Arc::default(),
             modules: Vec::new(),
             builds: 0,
             unit_fns: FxHashMap::default(),
+            thread_local_keys: FxHashMap::default(),
         }
     }
 
@@ -80,6 +85,7 @@ impl JitSession {
             .collect::<FxHashMap<_, _>>();
 
         let mut to_define: Vec<(MonoItem<'_>, MonoItemData)> = Vec::new();
+        let mut thread_local_images = FxHashSet::default();
         let mut new_unit_fns = Vec::new();
         // Every unsupported item is reported before giving up, not just the first.
         let mut refused = None;
@@ -109,6 +115,9 @@ impl JitSession {
                     // Statics keep their storage, so a changed initialiser has no effect.
                     let name = tcx.symbol_name(Instance::mono(tcx, def_id)).name;
                     if !self.registry.lock().unwrap().contains_key(name) {
+                        if jit_tls::is_thread_local(tcx, def_id) {
+                            thread_local_images.insert(def_id);
+                        }
                         to_define.push((item, data));
                     }
                 }
@@ -135,6 +144,13 @@ impl JitSession {
         let mut cached_context = Context::new();
         let output_filenames = tcx.output_filenames(());
         let should_write_ir = crate::pretty_clif::should_write_ir(tcx.sess);
+        let committed = &self.thread_local_keys;
+        // Thread-locals this build gives keys to. Key = committed count + index.
+        let mut new_keys = FxIndexMap::<String, DefId>::default();
+        let mut thread_local_key = |symbol: &str, def_id: DefId| match committed.get(symbol) {
+            Some(&key) => key,
+            None => committed.len() + new_keys.insert_full(symbol.to_owned(), def_id).0,
+        };
         tcx.sess.time("codegen mono items", || {
             for &(item, _) in &to_define {
                 match item {
@@ -145,9 +161,16 @@ impl JitSession {
                         debug_context.as_mut(),
                         &mut cached_context,
                         &mut module,
-                        None,
+                        Some(&mut thread_local_key),
                         instance,
                     ),
+                    MonoItem::Static(def_id) if thread_local_images.contains(&def_id) => {
+                        crate::constant::codegen_thread_local_image(tcx, &mut module, def_id);
+                        // Keyed with its image, even if nothing reads it yet, so any thread-local
+                        // keyed by a later build belongs to a dylib.
+                        let symbol = tcx.symbol_name(Instance::mono(tcx, def_id)).name;
+                        thread_local_key(symbol, def_id);
+                    }
                     MonoItem::Static(def_id) => {
                         crate::constant::codegen_static(tcx, &mut module, def_id);
                     }
@@ -163,11 +186,19 @@ impl JitSession {
             crate::main_shim::maybe_create_entry_wrapper(tcx, &mut module, false, true);
         }
 
+        let base = self.thread_local_keys.len();
+        let new_thread_locals = jit_tls::classify_new_thread_locals(
+            tcx,
+            new_keys.iter().enumerate().map(|(i, (symbol, &def_id))| (base + i, &**symbol, def_id)),
+            &thread_local_images,
+            &self.dylibs,
+        );
+
         if let Some(guar) = tcx.dcx().has_errors() {
             return Err(guar);
         }
         let jit = module.finalize_definitions();
-        self.commit(jit);
+        self.commit(jit, new_thread_locals, new_keys.into_keys());
         self.unit_fns.extend(new_unit_fns);
         self.builds = report.build;
         Ok(report)
@@ -177,8 +208,9 @@ impl JitSession {
         let mut builder =
             JITBuilder::with_isa(self.isa.clone(), cranelift_module::default_libcall_names());
         crate::compiler_builtins::register_functions_for_jit(&mut builder);
+        builder.symbol(THREAD_LOCAL_ACCESSOR, jit_tls::get as *const u8);
         let dylibs = self.dylibs.clone();
-        builder.symbol_lookup_fn(Box::new(move |name| (**dylibs.lock().unwrap())(name)));
+        builder.symbol_lookup_fn(Box::new(move |name| (*dylibs)(name)));
         // Lookups are tried newest first, so earlier builds win over the dylibs and `dlsym`.
         let registry = self.registry.clone();
         builder.symbol_lookup_fn(Box::new(move |name| {
@@ -192,7 +224,12 @@ impl JitSession {
         )
     }
 
-    fn commit(&mut self, jit: JITModule) {
+    fn commit(
+        &mut self,
+        jit: JITModule,
+        new_thread_locals: Vec<NewThreadLocal>,
+        new_keys: impl Iterator<Item = String>,
+    ) {
         let mut registry = self.registry.lock().unwrap();
         let declarations = jit.declarations();
         for (id, decl) in declarations.get_functions() {
@@ -209,6 +246,12 @@ impl JitSession {
                 registry.insert(name.clone(), jit.get_finalized_data(id).0.addr());
             }
         }
+        for new in new_thread_locals {
+            let (key, source) = jit_tls::source(new, |symbol| registry[symbol], &self.dylibs);
+            jit_tls::define(key, source);
+        }
+        let base = self.thread_local_keys.len();
+        self.thread_local_keys.extend(new_keys.enumerate().map(|(i, symbol)| (symbol, base + i)));
         self.modules.push(jit);
     }
 
