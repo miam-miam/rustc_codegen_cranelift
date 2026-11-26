@@ -50,7 +50,7 @@ use rustc_target::spec::{Arch, CfgAbi, Env, Os};
 
 pub use crate::config::*;
 #[cfg(feature = "jit")]
-pub use crate::driver::jit_session::{BuildReport, JitSession};
+pub use crate::driver::jit_session::{Batch, BuildError, BuildPolicy, ItemAction, JitSession};
 use crate::prelude::*;
 
 mod abi;
