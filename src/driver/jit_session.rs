@@ -1,6 +1,6 @@
-//! A JIT session that outlives individual rustc sessions. Each build compiles every function from
-//! the local crate, plus any code from other crates not yet defined into a module of its own,
-//! linked to earlier builds through a symbol registry.
+//! A JIT session that outlives individual rustc sessions. Each build compiles the items a
+//! `BuildPolicy` picks into a module of its own, linked to earlier builds through a symbol
+//! registry.
 
 use std::ffi::{c_char, c_int};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,6 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_hir::def::DefKind;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mono::{MonoItem, MonoItemData};
-use rustc_middle::ty::GenericArgKind;
 use rustc_session::config::DebugInfo;
 use rustc_span::ErrorGuaranteed;
 
@@ -24,14 +23,50 @@ use crate::constant::THREAD_LOCAL_ACCESSOR;
 use crate::prelude::*;
 use crate::unwind_module::UnwindModule;
 
-#[derive(Debug, Default)]
-pub struct BuildReport {
-    pub build: u32,
-    pub new_fns: usize,
-    /// Local functions defined by an earlier build and compiled again. Only this and later builds
-    /// call the new versions; code from earlier builds still calls the version it was compiled with.
-    pub recompiled_fns: usize,
-    pub reused_fns: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemAction {
+    /// Already defined and unchanged: the latest definition stays.
+    Reuse,
+    /// Its symbol was never committed.
+    Define,
+    /// Defined again because its code changed. Code from earlier builds still calls the version
+    /// it was compiled with.
+    Redefine,
+    /// Only its source positions changed. Compiled like `Redefine`, but callers that are reused
+    /// keep calling the old copy, with its old line table and panic locations.
+    Relocate,
+}
+
+/// Decides what each build compiles. Lives across builds, so nothing in it may borrow from one
+/// compilation.
+pub trait BuildPolicy {
+    /// One action per item, in order, before anything is declared. Refusals are emitted through
+    /// `tcx.dcx()`, so they read as ordinary compiler errors.
+    fn plan<'tcx>(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        items: &[MonoItem<'tcx>],
+    ) -> Result<Vec<ItemAction>, ErrorGuaranteed>;
+
+    /// The build finalised. A build that fails after `plan` never gets here, so the policy
+    /// records what is defined now rather than in `plan`.
+    fn committed(&mut self, batch: &Batch);
+}
+
+/// Either way, the session is unchanged.
+#[derive(Debug)]
+pub enum BuildError {
+    /// The policy refused an edit the running program can't take.
+    Refused(ErrorGuaranteed),
+    /// The build couldn't be compiled.
+    Failed(ErrorGuaranteed),
+}
+
+#[derive(Debug)]
+pub struct Batch {
+    pub generation: u32,
+    /// Every function in the build, by symbol, with what was done with it.
+    pub fns: Vec<(String, ItemAction)>,
 }
 
 pub struct JitSession {
@@ -75,33 +110,35 @@ impl JitSession {
     /// Compiles this build's mono items into a fresh module and finalises it. The session only
     /// changes on `Ok`. Errors are emitted through `tcx.dcx()`; fatal errors and panics part-way
     /// through unwind instead of returning, and also drop the module unfinalised.
-    pub fn compile(&mut self, tcx: TyCtxt<'_>) -> Result<BuildReport, ErrorGuaranteed> {
-        let mut report = BuildReport { build: self.builds + 1, ..BuildReport::default() };
-
+    pub fn compile(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        policy: &mut dyn BuildPolicy,
+    ) -> Result<Batch, BuildError> {
         let cgus = tcx.collect_and_partition_mono_items(()).codegen_units;
         let mono_items = cgus
             .iter()
             .flat_map(|cgu| cgu.items_in_deterministic_order(tcx))
-            .collect::<FxHashMap<_, _>>();
+            .collect::<FxIndexMap<_, _>>();
+        let items = mono_items.keys().copied().collect::<Vec<_>>();
+        let actions = tcx
+            .sess
+            .time("plan build", || policy.plan(tcx, &items))
+            .map_err(BuildError::Refused)?;
+        let mut batch = Batch { generation: self.builds + 1, fns: Vec::new() };
 
         let mut to_define: Vec<(MonoItem<'_>, MonoItemData)> = Vec::new();
         let mut thread_local_images = FxHashSet::default();
         let mut new_unit_fns = Vec::new();
         // Every unsupported item is reported before giving up, not just the first.
         let mut refused = None;
-        for (item, data) in mono_items {
+        for ((item, data), action) in mono_items.into_iter().zip(actions) {
             match item {
                 MonoItem::Fn(instance) => {
                     let name = tcx.symbol_name(instance).name;
-                    let defined = self.registry.lock().unwrap().contains_key(name);
-                    if defined && !may_change_between_builds(instance) {
-                        report.reused_fns += 1;
+                    batch.fns.push((name.to_owned(), action));
+                    if action == ItemAction::Reuse {
                         continue;
-                    }
-                    if defined {
-                        report.recompiled_fns += 1;
-                    } else {
-                        report.new_fns += 1;
                     }
                     if let Some(path) = unit_fn_path(tcx, instance) {
                         new_unit_fns.push((path, name.to_owned()));
@@ -112,14 +149,13 @@ impl JitSession {
                     to_define.push((item, data));
                 }
                 MonoItem::Static(def_id) => {
-                    // Statics keep their storage, so a changed initialiser has no effect.
-                    let name = tcx.symbol_name(Instance::mono(tcx, def_id)).name;
-                    if !self.registry.lock().unwrap().contains_key(name) {
-                        if jit_tls::is_thread_local(tcx, def_id) {
-                            thread_local_images.insert(def_id);
-                        }
-                        to_define.push((item, data));
+                    if action == ItemAction::Reuse {
+                        continue;
                     }
+                    if jit_tls::is_thread_local(tcx, def_id) {
+                        thread_local_images.insert(def_id);
+                    }
+                    to_define.push((item, data));
                 }
                 MonoItem::GlobalAsm(item_id) => {
                     let item = tcx.hir_item(item_id);
@@ -130,7 +166,7 @@ impl JitSession {
             }
         }
         if let Some(guar) = refused {
-            return Err(guar);
+            return Err(BuildError::Failed(guar));
         }
 
         let first_build = self.modules.is_empty();
@@ -195,13 +231,14 @@ impl JitSession {
         );
 
         if let Some(guar) = tcx.dcx().has_errors() {
-            return Err(guar);
+            return Err(BuildError::Failed(guar));
         }
         let jit = module.finalize_definitions();
         self.commit(jit, new_thread_locals, new_keys.into_keys());
         self.unit_fns.extend(new_unit_fns);
-        self.builds = report.build;
-        Ok(report)
+        self.builds = batch.generation;
+        policy.committed(&batch);
+        Ok(batch)
     }
 
     fn new_module(&self) -> UnwindModule<JITModule> {
@@ -308,32 +345,6 @@ fn preload_dylibs_deep_bound(crate_info: &CrateInfo) {
             std::mem::forget(library.unwrap());
         }
     }
-}
-
-/// Whether an instance's code can differ between builds: it is the local crate's own code, or
-/// another crate's generic code instantiated with local types or closures, whose code it calls.
-fn may_change_between_builds(instance: Instance<'_>) -> bool {
-    instance.def_id().is_local()
-        || instance.args.iter().flat_map(|arg| arg.walk()).any(|arg| {
-            let GenericArgKind::Type(ty) = arg.kind() else { return false };
-            match *ty.kind() {
-                ty::Adt(def, _) => def.did().is_local(),
-                ty::Foreign(def_id)
-                | ty::FnDef(def_id, _)
-                | ty::Closure(def_id, _)
-                | ty::CoroutineClosure(def_id, _)
-                | ty::Coroutine(def_id, _)
-                | ty::CoroutineWitness(def_id, _) => def_id.is_local(),
-                ty::Dynamic(predicates, ..) => {
-                    predicates.iter().any(|predicate| match predicate.skip_binder() {
-                        ty::ExistentialPredicate::Trait(t) => t.def_id.is_local(),
-                        ty::ExistentialPredicate::Projection(p) => p.def_id.is_local(),
-                        ty::ExistentialPredicate::AutoTrait(def_id) => def_id.is_local(),
-                    })
-                }
-                _ => false,
-            }
-        })
 }
 
 fn unit_fn_path(tcx: TyCtxt<'_>, instance: Instance<'_>) -> Option<String> {
